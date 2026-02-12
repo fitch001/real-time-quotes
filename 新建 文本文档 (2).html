@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ DOGE-SHENG QUANT ULTRA - 实时全周期监控</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body { background-color: #020617; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; overflow-x: hidden; }
+        .grid-bg { background-image: radial-gradient(#1e293b 1px, transparent 1px); background-size: 30px 30px; }
+        .glass-card { background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(16px); border: 1px solid rgba(51, 65, 85, 0.5); box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        .status-pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.1); } }
+        .signal-buy { border-left: 5px solid #10b981; background: linear-gradient(90deg, rgba(16,185,129,0.15), transparent); }
+        .signal-sell { border-left: 5px solid #ef4444; background: linear-gradient(90deg, rgba(239,68,68,0.15), transparent); }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        .fvg-label { font-size: 9px; padding: 1px 4px; border-radius: 4px; }
+        .price-up { color: #10b981; animation: flash-green 0.5s; }
+        .price-down { color: #ef4444; animation: flash-red 0.5s; }
+        @keyframes flash-green { from { background: rgba(16,185,129,0.2); } to { background: transparent; } }
+        @keyframes flash-red { from { background: rgba(239,68,68,0.2); } to { background: transparent; } }
+    </style>
+</head>
+<body class="grid-bg">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // ================= CONFIG 核心参数优化 =================
+        // 修正为币安U本位合约API (fapi)
+        const CONFIG = {
+            WS_BASE: "wss://fstream.binance.com",        // 合约WebSocket基础地址
+            REST_BASE: "https://fapi.binance.com/fapi/v1", // 合约REST API基础地址
+            SCAN_INTERVAL: 3000,         // 指标扫描频率(3秒)
+            UI_UPDATE_INTERVAL: 1000,    // UI强制刷新频率(1秒)
+            RISK_PER_TRADE: 0.02,       
+            ACCOUNT_BALANCE: 10000,      
+            SYMBOLS: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ETCUSDT", "LTCUSDT", "BNBUSDT", "XRPUSDT", "LINKUSDT"],
+            INTERVALS: ["1m", "5m", "15m", "1h", "4h"],
+            FIB_LOOKBACK: 100,
+            COOLDOWN_MINUTES: 5,
+            PRICE_DIFF_RATIO: 0.003,
+        };
+
+        // ================= MATH 量化工具库 =================
+        const MathLib = {
+            ema: (data, period) => {
+                if (data.length < period) return Array(data.length).fill(0);
+                const k = 2 / (period + 1);
+                let ema = [data[0]];
+                for (let i = 1; i < data.length; i++) ema.push(data[i] * k + ema[i - 1] * (1 - k));
+                return ema;
+            },
+            rsi: (closes, period = 14) => {
+                if (closes.length <= period) return 50;
+                let ups = 0, downs = 0;
+                for (let i = 1; i <= period; i++) {
+                    const diff = closes[i] - closes[i-1];
+                    if (diff > 0) ups += diff; else downs -= diff;
+                }
+                let avgUp = ups / period, avgDown = downs / period;
+                for (let i = period + 1; i < closes.length; i++) {
+                    const diff = closes[i] - closes[i-1];
+                    avgUp = (avgUp * (period - 1) + (diff > 0 ? diff : 0)) / period;
+                    avgDown = (avgDown * (period - 1) + (diff < 0 ? -diff : 0)) / period;
+                }
+                return 100 - (100 / (1 + (avgUp / (avgDown || 0.0001))));
+            },
+            calculateFib: (highs, lows) => {
+                const max = Math.max(...highs.slice(-CONFIG.FIB_LOOKBACK));
+                const min = Math.min(...lows.slice(-CONFIG.FIB_LOOKBACK));
+                const diff = max - min;
+                return {
+                    high: max, low: min,
+                    levels: { l236: max - 0.236 * diff, l382: max - 0.382 * diff, l500: max - 0.5 * diff, l618: max - 0.618 * diff, l786: max - 0.786 * diff }
+                };
+            },
+            detectFVG: (klines) => {
+                const lastIdx = klines.length - 1;
+                if (lastIdx < 3) return null;
+                for (let i = lastIdx; i > lastIdx - 8; i--) {
+                    if (klines[i].l > klines[i-2].h) return { type: "BULLISH", top: klines[i].l, bottom: klines[i-2].h };
+                    if (klines[i].h < klines[i-2].l) return { type: "BEARISH", top: klines[i-2].l, bottom: klines[i].h };
+                }
+                return null;
+            },
+            adx: (highs, lows, closes) => {
+                let tr = [], pDM = [], mDM = [];
+                for (let i = 1; i < highs.length; i++) {
+                    tr.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
+                    const up = highs[i] - highs[i-1], down = lows[i-1] - lows[i];
+                    pDM.push(up > down && up > 0 ? up : 0);
+                    mDM.push(down > up && down > 0 ? down : 0);
+                }
+                const sTR = MathLib.ema(tr, 14).pop(), sPDM = MathLib.ema(pDM, 14).pop(), sMDM = MathLib.ema(mDM, 14).pop();
+                if (!sTR) return { value: 0 };
+                const pDI = (sPDM / sTR) * 100, mDI = (sMDM / sTR) * 100;
+                return { value: (Math.abs(pDI - mDI) / (pDI + mDI) * 100) || 0, pDI, mDI };
+            },
+            atr: (highs, lows, closes) => {
+                let trs = [];
+                for (let i = 1; i < closes.length; i++) trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
+                return trs.slice(-14).reduce((a,b)=>a+b, 0) / 14;
+            }
+        };
+
+        // ================= UI COMPONENT =================
+        function App() {
+            const [marketData, setMarketData] = useState({});
+            const [alerts, setAlerts] = useState(function() {
+                try {
+                    return JSON.parse(localStorage.getItem('alerts_v4') || '[]');
+                } catch(e) {
+                    return [];
+                }
+            });
+            const [activeTab, setActiveTab] = useState(CONFIG.SYMBOLS[0]);
+            const [status, setStatus] = useState("初始化 WebSocket...");
+            
+            const ws = useRef(null);
+            const dataRef = useRef({});
+            const lastSignalRef = useRef({});
+
+            const fmtPrice = function(symbol, price) {
+                if (typeof price !== 'number' && !price) return "0.00";
+                const p = parseFloat(price);
+                if (isNaN(p)) return "0.00";
+                if (symbol.includes("BTC") || symbol.includes("ETH")) return p.toFixed(2);
+                if (symbol.includes("DOGE")) return p.toFixed(5);
+                return p.toFixed(4);
+            };
+
+            // 初始化 WebSocket (U本位合约)
+            useEffect(function() {
+                const streams = CONFIG.SYMBOLS.map(function(s) { return s.toLowerCase() + '@ticker'; }).join('/');
+                const wsUrl = CONFIG.WS_BASE + '/stream?streams=' + streams;
+                
+                try {
+                    ws.current = new WebSocket(wsUrl);
+                    
+                    ws.current.onopen = function() {
+                        setStatus("合约WebSocket已连接");
+                    };
+                    
+                    ws.current.onmessage = function(e) {
+                        try {
+                            const msg = JSON.parse(e.data);
+                            if (msg.data && msg.data.s) {
+                                const symbol = msg.data.s;
+                                const price = parseFloat(msg.data.c);
+                                const change = msg.data.P;
+                                
+                                if (!dataRef.current[symbol]) dataRef.current[symbol] = {};
+                                CONFIG.INTERVALS.forEach(function(inv) {
+                                    if (dataRef.current[symbol][inv]) {
+                                        dataRef.current[symbol][inv].price = price;
+                                        dataRef.current[symbol][inv].change = change;
+                                    }
+                                });
+                            }
+                        } catch (err) {}
+                    };
+                    
+                    ws.current.onerror = function() {
+                        setStatus("合约WebSocket连接失败，使用轮询模式");
+                    };
+                    
+                    ws.current.onclose = function() {
+                        setStatus("合约WebSocket已关闭");
+                    };
+                } catch(e) {
+                    setStatus("合约WebSocket初始化失败");
+                }
+
+                return function() {
+                    if (ws.current) ws.current.close();
+                };
+            }, []);
+
+            // 冷静期检查
+            const canTriggerSignal = function(symbol, direction, price) {
+                if (!lastSignalRef.current[symbol]) {
+                    lastSignalRef.current[symbol] = {};
+                }
+                const last = lastSignalRef.current[symbol][direction];
+                if (!last) return true;
+
+                const now = Date.now();
+                const minutesDiff = (now - last.timestamp) / (1000 * 60);
+                if (minutesDiff < CONFIG.COOLDOWN_MINUTES) return false;
+
+                const priceDiffRatio = Math.abs(price - last.price) / last.price;
+                if (priceDiffRatio < CONFIG.PRICE_DIFF_RATIO) return false;
+
+                return true;
+            };
+
+            const updateSignalRecord = function(symbol, direction, price) {
+                if (!lastSignalRef.current[symbol]) {
+                    lastSignalRef.current[symbol] = {};
+                }
+                lastSignalRef.current[symbol][direction] = {
+                    timestamp: Date.now(),
+                    price: price
+                };
+            };
+
+            // 核心分析逻辑
+            const analyze = function(symbol, data) {
+                var m1 = data["1m"];
+                var m5 = data["5m"];
+                var m15 = data["15m"];
+                var h1 = data["1h"];
+                var h4 = data["4h"];
+                if (!m1 || !h1 || !m1.price) return;
+                if (!h1.fib || !h1.fib.levels) return;
+
+                var price = m1.price;
+                var h1Fib = h1.fib.levels;
+                var action = "", score = 0, reason = "";
+
+                var m1AdxValue = m1.adx && typeof m1.adx.value === 'number' ? m1.adx.value : 0;
+                var m15Rsi = m15 && m15.rsi ? m15.rsi : 50;
+                var h4Ema144 = h4 && h4.ema144 ? h4.ema144 : 0;
+
+                if (m1.rsi > 75 && m1AdxValue > 35 && price > h1.ema144) {
+                    action = "做多 | 1m 超强动能";
+                    score = 80;
+                    reason = "1分钟超强趋势突破，大周期看涨。";
+                } 
+                else if (m5 && m5.fvg && m5.fvg.type === "BULLISH" && price <= h1Fib.l618 && price >= h1Fib.l786) {
+                    action = "做多 | 5m 机构回踩";
+                    score = 90;
+                    reason = "触及H1黄金折价区，且5m出现看涨FVG。";
+                }
+                else if (m15 && h4 && price >= h1Fib.l618 && price <= h1Fib.l786 && price < h4Ema144 && m15Rsi > 70) {
+                    action = "做空 | 15m 高位超买";
+                    score = 85;
+                    reason = "触及溢价区阻力，15m超买，大周期空头趋势。";
+                }
+
+                if (action && score >= 80) {
+                    var direction = action.includes("多") ? "LONG" : "SHORT";
+                    if (!canTriggerSignal(symbol, direction, price)) {
+                        return;
+                    }
+
+                    var m15Atr = (m15 && m15.atr) ? m15.atr : 50;
+                    var alertId = symbol + '-' + action + '-' + new Date().getMinutes();
+                    setAlerts(function(prev) {
+                        for (var i = 0; i < prev.length; i++) {
+                            if (prev[i].id === alertId) return prev;
+                        }
+                        var sl = action.includes("多") ? price - (m15Atr * 2) : price + (m15Atr * 2);
+                        var tp = action.includes("多") ? price + (m15Atr * 4) : price - (m15Atr * 4);
+                        
+                        try {
+                            var utterance = new SpeechSynthesisUtterance(symbol + ' ' + action.split('|')[0]);
+                            window.speechSynthesis.speak(utterance);
+                        } catch(e) {}
+                        
+                        var newAlert = { 
+                            id: alertId, 
+                            symbol: symbol, 
+                            action: action, 
+                            price: price, 
+                            sl: sl, 
+                            tp: tp, 
+                            score: score, 
+                            reason: reason, 
+                            time: new Date().toLocaleTimeString() 
+                        };
+                        var updated = [newAlert].concat(prev).slice(0, 30);
+                        try {
+                            localStorage.setItem('alerts_v4', JSON.stringify(updated));
+                        } catch(e) {}
+                        
+                        updateSignalRecord(symbol, direction, price);
+                        return updated;
+                    });
+                }
+            };
+
+            // 定时获取K线 (U本位合约)
+            var fetchKlines = function() {
+                setStatus("同步合约K线指标中...");
+                var promises = CONFIG.SYMBOLS.map(function(symbol) {
+                    return Promise.all(CONFIG.INTERVALS.map(function(inv) {
+                        return axios.get(CONFIG.REST_BASE + '/klines', {
+                            params: {
+                                symbol: symbol,
+                                interval: inv,
+                                limit: 100
+                            }
+                        }).catch(function(err) {
+                            console.error('合约K线获取失败', symbol, inv, err);
+                            return { data: [] };
+                        });
+                    })).then(function(intervalResults) {
+                        if (!dataRef.current[symbol]) dataRef.current[symbol] = {};
+
+                        intervalResults.forEach(function(res, index) {
+                            if (!res || !res.data || !Array.isArray(res.data) || res.data.length === 0) return;
+                            var inv = CONFIG.INTERVALS[index];
+                            var k = res.data.map(function(d) { 
+                                return { 
+                                    t: d[0], 
+                                    o: parseFloat(d[1]), 
+                                    h: parseFloat(d[2]), 
+                                    l: parseFloat(d[3]), 
+                                    c: parseFloat(d[4]), 
+                                    v: parseFloat(d[5]) 
+                                }; 
+                            });
+                            var closes = k.map(function(x) { return x.c; });
+                            var highs = k.map(function(x) { return x.h; });
+                            var lows = k.map(function(x) { return x.l; });
+                            
+                            var prevData = dataRef.current[symbol][inv] || {};
+                            var currentPrice = prevData.price || closes[closes.length-1];
+                            
+                            dataRef.current[symbol][inv] = {
+                                price: currentPrice,
+                                change: prevData.change || 0,
+                                ema20: MathLib.ema(closes, 20).pop(),
+                                ema144: MathLib.ema(closes, 144).pop(),
+                                rsi: MathLib.rsi(closes, 14),
+                                adx: MathLib.adx(highs, lows, closes),
+                                atr: MathLib.atr(highs, lows, closes),
+                                fib: MathLib.calculateFib(highs, lows),
+                                fvg: MathLib.detectFVG(k),
+                                lastK: k[k.length-1]
+                            };
+                        });
+                        analyze(symbol, dataRef.current[symbol]);
+                    });
+                });
+
+                Promise.all(promises).then(function() {
+                    setMarketData(JSON.parse(JSON.stringify(dataRef.current)));
+                    setStatus('合约实时流运行中 ' + new Date().toLocaleTimeString());
+                }).catch(function(e) {
+                    console.error("合约K线获取错误", e);
+                    setStatus("合约API请求受限，重试中...");
+                });
+            };
+
+            useEffect(function() {
+                fetchKlines();
+                var timer = setInterval(fetchKlines, CONFIG.SCAN_INTERVAL);
+                var uiTimer = setInterval(function() {
+                    setMarketData(function(prev) {
+                        return JSON.parse(JSON.stringify(dataRef.current));
+                    });
+                }, CONFIG.UI_UPDATE_INTERVAL);
+                return function() { 
+                    clearInterval(timer); 
+                    clearInterval(uiTimer); 
+                };
+            }, []);
+
+            return (
+                <div className="max-w-[1600px] mx-auto p-4 lg:p-6">
+                    {/* Header */}
+                    <header className="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
+                        <div>
+                            <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(16,185,129,0.4)]">
+                                    <span className="text-2xl font-black text-white">DS</span>
+                                </div>
+                                <div>
+                                    <h1 className="text-2xl font-black tracking-tighter text-white">DOGE-SHENG <span className="text-emerald-500">QUANT ULTRA</span></h1>
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest flex items-center gap-2">
+                                        <span className="w-2 h-2 bg-emerald-500 rounded-full status-pulse"></span>
+                                        U本位合约 • 全周期FVG共振 | {status}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex gap-3">
+                            <div className="glass-card px-4 py-2 rounded-xl border-emerald-500/20">
+                                <p className="text-[10px] text-slate-500">系统状态</p>
+                                <p className="text-xs font-bold text-emerald-400">合约流正常</p>
+                            </div>
+                            <button onClick={function() { setAlerts([]); }} className="glass-card px-4 py-2 rounded-xl text-xs hover:bg-red-500/20 transition-colors">清除记录</button>
+                        </div>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                        {/* 1. 侧边币种列表 */}
+                        <div className="lg:col-span-3 space-y-2 max-h-[85vh] overflow-y-auto pr-1">
+                            {CONFIG.SYMBOLS.map(function(sym) {
+                                var d = null;
+                                if (marketData[sym] && marketData[sym]["15m"]) {
+                                    d = marketData[sym]["15m"];
+                                }
+                                var isActive = activeTab === sym;
+                                var changeValue = d && d.change ? d.change : '0.00';
+                                var changeNum = parseFloat(changeValue);
+                                var changeClass = changeNum >= 0 ? 'text-emerald-400' : 'text-red-400';
+                                var priceDisplay = fmtPrice(sym, d && d.price ? d.price : 0);
+                                
+                                var hasH1Fvg = false;
+                                var fvgType = '';
+                                if (marketData[sym] && marketData[sym]["1h"] && marketData[sym]["1h"].fvg) {
+                                    hasH1Fvg = true;
+                                    fvgType = marketData[sym]["1h"].fvg.type;
+                                }
+                                
+                                return (
+                                    <div key={sym} onClick={function() { setActiveTab(sym); }} 
+                                         className={'glass-card p-3 rounded-xl cursor-pointer transition-all border-l-4 ' + (isActive ? 'border-emerald-500 bg-emerald-500/10' : 'border-transparent opacity-70')}>
+                                        <div className="flex justify-between items-center">
+                                            <span className="font-black text-lg">{sym.replace("USDT","")}</span>
+                                            <span className={'text-[10px] font-bold ' + changeClass}>
+                                                {changeValue}%
+                                            </span>
+                                        </div>
+                                        <div className="text-lg font-mono font-bold">${priceDisplay}</div>
+                                        {hasH1Fvg && (
+                                            <div className="mt-1 flex gap-1">
+                                                <span className={'text-[8px] px-1 rounded ' + (fvgType === 'BULLISH' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400')}>
+                                                    H1 FVG
+                                                </span>
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {/* 2. 主分析面板 */}
+                        <div className="lg:col-span-6 space-y-4">
+                            <div className="glass-card p-6 rounded-3xl min-h-[500px] relative overflow-hidden">
+                                <div className="absolute -top-10 -right-10 opacity-[0.03] text-[180px] font-black">{activeTab.replace("USDT","")}</div>
+                                
+                                <div className="flex justify-between items-end mb-8 relative z-10">
+                                    <div>
+                                        <h2 className="text-3xl font-black italic">{activeTab}</h2>
+                                        <p className="text-[10px] text-slate-500 uppercase tracking-widest">Multi-Interval Analysis</p>
+                                    </div>
+                                    <div className="text-right">
+                                        <p className="text-4xl font-mono font-black text-emerald-400 shadow-sm">
+                                            ${fmtPrice(activeTab, marketData[activeTab] && marketData[activeTab]["1m"] ? marketData[activeTab]["1m"].price : 0)}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                {/* 斐波那契可视化 */}
+                                <div className="bg-slate-900/50 p-4 rounded-2xl border border-slate-800 mb-6">
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-500 mb-4">
+                                        <span>FIBONACCI (1H)</span>
+                                        <span className="text-orange-400">GOLDEN POCKET 0.618-0.786</span>
+                                    </div>
+                                    <div className="space-y-3">
+                                        {marketData[activeTab] && marketData[activeTab]["1h"] && marketData[activeTab]["1h"].fib ? 
+                                            Object.entries(marketData[activeTab]["1h"].fib.levels).reverse().map(function(item) {
+                                                var lv = item[0];
+                                                var val = item[1];
+                                                var currentPrice = marketData[activeTab] && marketData[activeTab]["1m"] ? marketData[activeTab]["1m"].price : 0;
+                                                var isNear = Math.abs(currentPrice - val) / (val || 1) < 0.003;
+                                                var fibHigh = marketData[activeTab]["1h"].fib.high || 1;
+                                                var widthPercent = (val / fibHigh) * 100;
+                                                return (
+                                                    <div key={lv} className="flex items-center gap-3">
+                                                        <span className="text-[9px] w-8 text-slate-500 font-mono">{lv.replace("l","")}</span>
+                                                        <div className="flex-1 h-1.5 bg-slate-800 rounded-full relative">
+                                                            <div className={'h-full rounded-full ' + (isNear ? 'bg-yellow-400 shadow-[0_0_10px_#facc15]' : 'bg-slate-700')} style={{width: widthPercent + '%'}}></div>
+                                                        </div>
+                                                        <span className={'text-[10px] font-mono ' + (isNear ? 'text-yellow-400 font-bold' : 'text-slate-400')}>${fmtPrice(activeTab, val)}</span>
+                                                    </div>
+                                                );
+                                            }) : <div className="animate-pulse h-20 bg-slate-800/50 rounded-lg"></div>
+                                        }
+                                    </div>
+                                </div>
+
+                                {/* 四宫格指标 */}
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                    {["1m", "15m", "1h", "4h"].map(function(iv) {
+                                        var d = marketData[activeTab] && marketData[activeTab][iv];
+                                        var rsiValue = d && d.rsi ? d.rsi.toFixed(1) : '0.0';
+                                        var rsiClass = 'text-slate-300';
+                                        if (d && d.rsi) {
+                                            if (d.rsi > 70) rsiClass = 'text-red-400';
+                                            else if (d.rsi < 30) rsiClass = 'text-emerald-400';
+                                        }
+                                        var adxValue = d && d.adx && d.adx.value ? d.adx.value.toFixed(1) : '0.0';
+                                        var emaDir = '↓';
+                                        var emaClass = 'text-red-500';
+                                        if (d && d.price && d.ema144) {
+                                            if (d.price > d.ema144) {
+                                                emaDir = '↑';
+                                                emaClass = 'text-emerald-500';
+                                            }
+                                        }
+                                        return (
+                                            <div key={iv} className="bg-slate-900/40 p-3 rounded-xl border border-slate-800 hover:border-slate-600 transition-colors">
+                                                <p className="text-[10px] font-black text-slate-500 mb-2 uppercase">{iv} STATS</p>
+                                                <div className="space-y-1">
+                                                    <div className="flex justify-between text-[10px] font-mono">
+                                                        <span>RSI</span>
+                                                        <span className={rsiClass}>{rsiValue}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[10px] font-mono">
+                                                        <span>ADX</span>
+                                                        <span className="text-amber-400">{adxValue}</span>
+                                                    </div>
+                                                    <div className="flex justify-between text-[10px] font-mono">
+                                                        <span>EMA</span>
+                                                        <span className={emaClass}>{emaDir}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* 3. 实时信号流 */}
+                        <div className="lg:col-span-3">
+                            <h3 className="text-[10px] font-black text-slate-500 mb-4 tracking-[0.3em] uppercase">Signal Pulse</h3>
+                            <div className="space-y-3 max-h-[85vh] overflow-y-auto pr-1">
+                                {alerts.length === 0 ? (
+                                    <div className="glass-card p-10 text-center rounded-2xl border-dashed">
+                                        <div className="text-2xl animate-bounce mb-2">🔭</div>
+                                        <p className="text-[10px] text-slate-500">正在扫描市场共振点...</p>
+                                    </div>
+                                ) : (
+                                    alerts.map(function(a, i) {
+                                        var isBuy = a.action.includes("多");
+                                        var signalClass = isBuy ? "signal-buy" : "signal-sell";
+                                        var actionColor = isBuy ? "text-emerald-400" : "text-red-400";
+                                        return (
+                                            <div key={i} className={'p-4 rounded-xl glass-shadow transition-all hover:scale-[1.02] glass-card ' + signalClass}>
+                                                <div className="flex justify-between items-start mb-2">
+                                                    <span className="font-black text-base">{a.symbol.replace("USDT","")}</span>
+                                                    <span className="text-[9px] font-mono bg-black/40 px-2 py-0.5 rounded text-slate-400">{a.time}</span>
+                                                </div>
+                                                <div className={'text-xs font-bold ' + actionColor}>{a.action}</div>
+                                                <p className="text-[9px] text-slate-500 mt-2 mb-3 leading-relaxed italic">"{a.reason}"</p>
+                                                
+                                                <div className="grid grid-cols-2 gap-2 text-[9px] font-mono bg-black/40 p-2 rounded-lg border border-white/5">
+                                                    <div className="text-slate-400">入场: <span className="text-white">${fmtPrice(a.symbol, a.price)}</span></div>
+                                                    <div className="text-red-400">止损: ${fmtPrice(a.symbol, a.sl)}</div>
+                                                    <div className="text-emerald-400 text-right col-span-2">止盈: ${fmtPrice(a.symbol, a.tp)}</div>
+                                                </div>
+                                                <div className="mt-3 flex items-center gap-2">
+                                                    <div className="flex-1 h-1 bg-slate-800 rounded-full overflow-hidden">
+                                                        <div className="h-full bg-gradient-to-r from-emerald-500 to-blue-500" style={{width: a.score + '%'}}></div>
+                                                    </div>
+                                                    <span className="text-[9px] font-bold text-emerald-400">{a.score}%</span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <footer className="mt-8 pt-6 border-t border-slate-800/50 flex flex-col md:flex-row justify-between items-center gap-4">
+                        <div className="flex gap-6 text-[9px] font-bold text-slate-600 uppercase tracking-widest">
+                            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500"></span> FIB 0.618</span>
+                            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-500"></span> FVG GAP</span>
+                            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-purple-500"></span> WS REALTIME</span>
+                        </div>
+                        <p className="text-[9px] text-slate-700">DOGE-SHENG QUANT V4.0 // U本位合约专版</p>
+                    </footer>
+                </div>
+            );
+        }
+
+        var root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+    </script>
+</body>
+</html>
